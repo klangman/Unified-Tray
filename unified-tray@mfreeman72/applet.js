@@ -22,6 +22,7 @@ const DND = imports.ui.dnd;
 const Main = imports.ui.main;
 const Mainloop = imports.mainloop;
 const PopupMenu = imports.ui.popupMenu;
+const RadioButton = imports.ui.radioButton;
 const Settings = imports.ui.settings;
 const SignalManager = imports.misc.signalManager;
 const Tooltips = imports.ui.tooltips;
@@ -314,7 +315,74 @@ const MENU_ICON_SIZE = 16;
  */
 let _applet = null;   // the running applet instance (so menu items can close its menu)
 
-function makeMenuItem(text, iconActor, reserveIcon, indicator) {
+/*
+ * Whether an icon name can actually be shown: a name the icon theme doesn't have
+ * would leave a blank slot (and push every sibling's label to the right).
+ */
+function iconNameUsable(name) {
+    let n = String(name || "");
+    if (!n)
+        return false;
+    if (n.startsWith("/"))
+        return GLib.file_test(n, GLib.FileTest.EXISTS);
+    try {
+        let theme = Gtk.IconTheme.get_default();
+        if (!theme)
+            return true;
+        return theme.has_icon(n) || (n.endsWith("-symbolic") && theme.has_icon(n.slice(0, -"-symbolic".length)));
+    } catch (e) {
+        return true;
+    }
+}
+
+function hasUsableIcon(props) {
+    return iconNameUsable(props["icon-name"]) || !!(props["icon-data"] && props["icon-data"].length > 0);
+}
+
+/*
+ * St.Bin-based widgets (switch, radio button) read x_align/y_align as St.Align on some
+ * Cinnamon versions, so they are centered through a plain box around them instead.
+ */
+function centered(actor) {
+    let holder = new St.BoxLayout({ y_align: Clutter.ActorAlign.CENTER });
+    holder.add_actor(actor);
+    return holder;
+}
+
+/*
+ * The theme's radio button (the same one Cinnamon's own menus use), not
+ * reactive: the whole menu item is what gets clicked. Returns { actor, set(state) }.
+ */
+function makeRadioIndicator(state) {
+    try {
+        let rb = new RadioButton.RadioButton();
+        let actor = rb.actor || rb;           // older Cinnamon versions wrap the actor
+        actor.reactive = false;
+        actor.can_focus = false;
+        let set = (on) => {
+            if (typeof rb.setChecked === "function")
+                rb.setChecked(on);
+            else
+                actor.checked = on;
+        };
+        set(state);
+        return { actor: centered(actor), set: set };
+    } catch (e) {
+        let label = new St.Label({ y_align: Clutter.ActorAlign.CENTER, style: "min-width: 1.2em;" });
+        let set = (on) => label.set_text(on ? "\u25C9" : "\u25CB");
+        set(state);
+        return { actor: label, set: set };
+    }
+}
+
+/*
+ * indicator: null (no indicator column), "" (an empty slot so labels line up
+ * with radio items) or { radio: state }.
+ * opts.switchState (boolean) adds an on/off switch at the right edge, like the
+ * switches in Cinnamon's own applet menus; opts.keepMenu keeps the menu open
+ * when it is flipped. Items with an indicator or a switch get setToggleState().
+ */
+function makeMenuItem(text, iconActor, reserveIcon, indicator, opts) {
     let item = new PopupMenu.PopupBaseMenuItem();
     /* Choosing an entry closes the menu (connected first, so it also happens if a later handler fails) */
     item.connect("activate", (it, event, keepMenu) => {
@@ -323,10 +391,16 @@ function makeMenuItem(text, iconActor, reserveIcon, indicator) {
             _applet.menu.close(true);
         }
     });
-    let box = new St.BoxLayout({ style: "spacing: 6px;" });
-    /* Check / radio mark (a string), or "" to keep the column of items that are not toggles aligned */
-    if (typeof indicator === "string") {
-        box.add_actor(new St.Label({ text: indicator, y_align: Clutter.ActorAlign.CENTER, style: "min-width: 1.2em;" }));
+    let box = new St.BoxLayout({ style: "spacing: 6px;", x_expand: true });
+    if (indicator && typeof indicator === "object") {
+        let radio = makeRadioIndicator(!!indicator.radio);
+        box.add_actor(radio.actor);
+        item.setToggleState = radio.set;
+    } else if (indicator === "") {
+        /* An invisible radio button takes exactly the room a visible one does */
+        let slot = makeRadioIndicator(false);
+        slot.actor.opacity = 0;
+        box.add_actor(slot.actor);
     }
     if (iconActor) {
         iconActor.y_align = Clutter.ActorAlign.CENTER;
@@ -334,8 +408,21 @@ function makeMenuItem(text, iconActor, reserveIcon, indicator) {
     } else if (reserveIcon) {
         box.add_actor(new St.Bin({ width: MENU_ICON_SIZE, height: MENU_ICON_SIZE }));
     }
-    item.label = new St.Label({ text: text, y_align: Clutter.ActorAlign.CENTER });
+    item.label = new St.Label({ text: text, y_align: Clutter.ActorAlign.CENTER, x_expand: true });
     box.add_actor(item.label);
+    if (opts && typeof opts.switchState === "boolean") {
+        let sw = new PopupMenu.Switch(opts.switchState);
+        box.add_actor(centered(sw.actor));
+        item._switch = sw;
+        item.setToggleState = (on) => sw.setToggleState(on);
+        let keepMenu = !!opts.keepMenu;
+        /* Like PopupSwitchMenuItem: clicking anywhere on the item flips the switch */
+        item.activate = function (event) {
+            if (sw.actor.mapped)
+                sw.toggle();
+            PopupMenu.PopupBaseMenuItem.prototype.activate.call(this, event, keepMenu);
+        };
+    }
     item.addActor(box, { span: -1, expand: true });
     item.actor.label_actor = item.label;
     return item;
@@ -346,8 +433,39 @@ function makeMenuItem(text, iconActor, reserveIcon, indicator) {
  * menu items. Subclasses provide the transport for activations.
  */
 class MenuBuilder {
+    constructor() {
+        this.toggleItems = {};          // dbusmenu id -> shown checkmark/radio item
+        this.keepMenuOnToggle = false;  // whether flipping a switch leaves the menu open
+    }
+
     sendEvent(id, type) { /* subclass */ }
     onSubmenuState(id, item, open) { /* subclass */ }
+    onToggleSent() { /* subclass */ }
+
+    /* The layout with the toggle states left out: equal keys mean only switches/radios changed */
+    shapeKey() {
+        return JSON.stringify(this.layout, (k, v) => k === "toggle-state" ? undefined : v);
+    }
+
+    /* Show the layout's toggle states on the items in the open menu; false if some item is missing */
+    applyToggleStates() {
+        let ok = true;
+        let walk = (node) => {
+            for (let kid of (node && node[2]) || []) {
+                let p = kid[1] || {};
+                if (p.visible !== false && (p["toggle-type"] === "checkmark" || p["toggle-type"] === "radio")) {
+                    let item = this.toggleItems[kid[0]];
+                    if (item && item.setToggleState)
+                        item.setToggleState(p["toggle-state"] === 1);
+                    else
+                        ok = false;
+                }
+                walk(kid);
+            }
+        };
+        walk(this.layout);
+        return ok;
+    }
 
     _visibleItems(node) {
         let kids = (node && node[2]) || [];
@@ -355,6 +473,7 @@ class MenuBuilder {
     }
 
     populate(shell, reserveIcon) {
+        this.toggleItems = {};
         if (this.layout)
             this._buildChildren(shell, this.layout, !!reserveIcon);
     }
@@ -373,9 +492,10 @@ class MenuBuilder {
     _buildChildren(shell, node, reserveIcon) {
         let kids = node[2] || [];
         let anyIcon = !!reserveIcon || kids.some(k => k[1].visible !== false && k[1].type !== "separator" &&
-            (k[1]["icon-name"] || (k[1]["icon-data"] && k[1]["icon-data"].length > 0)));
-        let anyToggle = kids.some(k => k[1].visible !== false && k[1].type !== "separator" &&
-            (k[1]["toggle-type"] === "checkmark" || k[1]["toggle-type"] === "radio"));
+            hasUsableIcon(k[1]));
+        /* Only radio items have a mark in front of the label (checkmark items get a switch at the end) */
+        let anyRadio = kids.some(k => k[1].visible !== false && k[1].type !== "separator" &&
+            k[1]["toggle-type"] === "radio");
         let pendingSeparator = false;
         let any = false;
         for (let kid of kids) {
@@ -394,7 +514,7 @@ class MenuBuilder {
                 pendingSeparator = false;
             }
             any = true;
-            shell.addMenuItem(this._makeItem(id, props, sub, anyIcon, anyToggle));
+            shell.addMenuItem(this._makeItem(id, props, sub, anyIcon, anyRadio));
         }
     }
 
@@ -412,7 +532,7 @@ class MenuBuilder {
 
         let iconActor = null;
         try {
-            if (props["icon-name"]) {
+            if (iconNameUsable(props["icon-name"])) {
                 let n = String(props["icon-name"]);
                 if (n.startsWith("/")) {
                     iconActor = new St.Icon({
@@ -441,18 +561,28 @@ class MenuBuilder {
 
         let toggleType = props["toggle-type"];
         let on = props["toggle-state"] === 1;
-        let indicator = null;
+        let indicator = reserveToggle ? "" : null;
+        let opts = null;
         if (toggleType === "checkmark")
-            indicator = on ? "\u2611" : "\u2610";
+            opts = { switchState: on, keepMenu: this.keepMenuOnToggle };
         else if (toggleType === "radio")
-            indicator = on ? "\u25C9" : "\u25CB";
-        else if (reserveToggle)
-            indicator = "";
+            indicator = { radio: on };
 
-        let item = makeMenuItem(label, iconActor, reserveIcon, indicator);
+        let item = makeMenuItem(label, iconActor, reserveIcon, indicator, opts);
 
         item.setSensitive(enabled);
-        item.connect("activate", () => this.sendEvent(id, "clicked"));
+        item.connect("activate", () => {
+            this.sendEvent(id, "clicked");
+            if (opts && opts.keepMenu)
+                this.onToggleSent();
+        });
+        if (toggleType === "checkmark" || toggleType === "radio") {
+            this.toggleItems[id] = item;
+            item.connect("destroy", () => {
+                if (this.toggleItems[id] === item)
+                    delete this.toggleItems[id];
+            });
+        }
         return item;
     }
 }
@@ -471,7 +601,10 @@ class DBusMenuClient extends MenuBuilder {
         this.layoutJson = "";
         this.destroyed = false;
         this.changeTimer = 0;
+        this.resyncTimer = 0;
         this.subIds = [];
+        /* The application tells about the new state, so a switch can stay in an open menu */
+        this.keepMenuOnToggle = true;
 
         let bus = Gio.DBus.session;
         let onSignal = () => this._scheduleChange();
@@ -528,6 +661,21 @@ class DBusMenuClient extends MenuBuilder {
         });
     }
 
+    /*
+     * After a switch was flipped in the open menu, read the menu again a little later even if the
+     * application sent no signal, so a switch the application did not follow flips back.
+     */
+    onToggleSent() {
+        if (this.resyncTimer)
+            Mainloop.source_remove(this.resyncTimer);
+        this.resyncTimer = Mainloop.timeout_add(700, () => {
+            this.resyncTimer = 0;
+            if (!this.destroyed)
+                this.onExternalChange();
+            return false;
+        });
+    }
+
     sendEvent(id, type) {
         let ts = Math.floor(Date.now() / 1000) >>> 0;
         this._call("Event",
@@ -567,6 +715,10 @@ class DBusMenuClient extends MenuBuilder {
         if (this.changeTimer) {
             Mainloop.source_remove(this.changeTimer);
             this.changeTimer = 0;
+        }
+        if (this.resyncTimer) {
+            Mainloop.source_remove(this.resyncTimer);
+            this.resyncTimer = 0;
         }
         for (let id of this.subIds)
             Gio.DBus.session.signal_unsubscribe(id);
@@ -1641,9 +1793,9 @@ class SniEntry extends TrayEntry {
         if (wantOpen && hasItems && source.hasOpenLikeItem(name))
             wantOpen = false;
 
-        let reserve = false;
+        /* The "Open" entry sits above a separator, so its icon doesn't indent the items below */
         if (wantOpen)
-            reserve = this.addOpenItem(menu, () => this.activate());
+            this.addOpenItem(menu, () => this.activate());
 
         if (this.hasDbusMenu() && !hasItems)
             warn("dbusmenu " + this.props.Menu + " of " + this.busName + " returned no visible items");
@@ -1651,7 +1803,7 @@ class SniEntry extends TrayEntry {
         if (hasItems) {
             if (wantOpen)
                 menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-            source.populate(menu, reserve);
+            source.populate(menu, false);
         } else if (isMenuOnly || !wantOpen) {
             /* No dbusmenu: ask the application to show its own context menu. */
             let item = makeMenuItem(_("Show application menu"), null);
@@ -2062,10 +2214,9 @@ class XAppEntry extends TrayEntry {
 
     fillMenu(menu) {
         /* No "Open ..." entry for applications whose left click shows a menu instead of a window */
-        let reserve = false;
         let added = false;
         if (this.applet.showOpenEntry && !this.primaryIsMenu && !this.openSuppressed()) {
-            reserve = this.addOpenItem(menu, () => {
+            this.addOpenItem(menu, () => {
                 let t = Clutter.get_current_event_time();
                 this._sawPopup = false;
                 this.applet.runOpen(this, () => this.primaryClick(t), () => this._sawPopup);
@@ -2077,7 +2228,7 @@ class XAppEntry extends TrayEntry {
             let source = new GtkMenuSource(this.gtkItems, this);
             if (added)
                 menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-            source.populate(menu, reserve);
+            source.populate(menu, false);
         } else if (!this.canTranslateNative()) {
             /* Translation unavailable: let the application show its own menu. */
             menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
@@ -2373,7 +2524,10 @@ class UnifiedTrayApplet extends Applet.Applet {
             connect(global, "scale-changed", this.ui_scale_changed);
         });
 
-        this._stage("legacy tray", () => this._startLegacy());
+        /* The legacy tray starts in on_applet_added_to_panel(): manage_screen() reads the theme of
+         * this.actor, which only works once the actor is on the stage */
+        if (this.actor.get_stage())
+            this._stage("legacy tray", () => this._startLegacy());
         this._stage("xapp", () => this._startXApp());
         this._stage("statusnotifier", () => this._startSni());
 
@@ -2645,6 +2799,10 @@ class UnifiedTrayApplet extends Applet.Applet {
         this.menu.close(false);
         this._newMenu();
         this.refreshIcons();
+    }
+
+    on_applet_added_to_panel() {
+        this._stage("legacy tray", () => this._startLegacy());
     }
 
     on_applet_removed_from_panel() {
@@ -2927,8 +3085,15 @@ class UnifiedTrayApplet extends Applet.Applet {
     menuLayoutChanged(entry) {
         if (this.menuEntry !== entry || !this.menu.isOpen || !entry.menuClient)
             return;
-        entry.menuClient.fetch((changed) => {
-            if (changed && this.menuEntry === entry && this.menu.isOpen)
+        let client = entry.menuClient;
+        let before = client.layout ? client.shapeKey() : null;
+        client.fetch((changed) => {
+            if (this.menuEntry !== entry || !this.menu.isOpen)
+                return;
+            /* Only toggle states changed (e.g. a switch was flipped): update the items in place */
+            if (before !== null && client.shapeKey() === before && client.applyToggleStates())
+                return;
+            if (changed)
                 this._renderMenu();
         });
     }
