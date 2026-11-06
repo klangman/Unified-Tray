@@ -314,14 +314,20 @@ const MENU_ICON_SIZE = 16;
  */
 let _applet = null;   // the running applet instance (so menu items can close its menu)
 
-function makeMenuItem(text, iconActor, reserveIcon) {
+function makeMenuItem(text, iconActor, reserveIcon, indicator) {
     let item = new PopupMenu.PopupBaseMenuItem();
     /* Choosing an entry closes the menu (connected first, so it also happens if a later handler fails) */
     item.connect("activate", (it, event, keepMenu) => {
-        if (!keepMenu && _applet && _applet.menu)
+        if (!keepMenu && _applet && _applet.menu) {
+            _applet._closedByActivation = true;
             _applet.menu.close(true);
+        }
     });
     let box = new St.BoxLayout({ style: "spacing: 6px;" });
+    /* Check / radio mark (a string), or "" to keep the column of items that are not toggles aligned */
+    if (typeof indicator === "string") {
+        box.add_actor(new St.Label({ text: indicator, y_align: Clutter.ActorAlign.CENTER, style: "min-width: 1.2em;" }));
+    }
     if (iconActor) {
         iconActor.y_align = Clutter.ActorAlign.CENTER;
         box.add_actor(iconActor);
@@ -333,17 +339,6 @@ function makeMenuItem(text, iconActor, reserveIcon) {
     item.addActor(box, { span: -1, expand: true });
     item.actor.label_actor = item.label;
     return item;
-}
-
-function applyOrnament(item, toggleType, on, label) {
-    try {
-        if (typeof item.setOrnament === "function" && PopupMenu.OrnamentType) {
-            item.setOrnament(toggleType === "radio" ? PopupMenu.OrnamentType.DOT : PopupMenu.OrnamentType.CHECK, on);
-            return;
-        }
-    } catch (e) { /* fall back below */ }
-    let mark = on ? (toggleType === "radio" ? "\u25CF " : "\u2713 ") : "    ";
-    item.label.set_text(mark + label);
 }
 
 /*
@@ -379,6 +374,8 @@ class MenuBuilder {
         let kids = node[2] || [];
         let anyIcon = !!reserveIcon || kids.some(k => k[1].visible !== false && k[1].type !== "separator" &&
             (k[1]["icon-name"] || (k[1]["icon-data"] && k[1]["icon-data"].length > 0)));
+        let anyToggle = kids.some(k => k[1].visible !== false && k[1].type !== "separator" &&
+            (k[1]["toggle-type"] === "checkmark" || k[1]["toggle-type"] === "radio"));
         let pendingSeparator = false;
         let any = false;
         for (let kid of kids) {
@@ -397,11 +394,11 @@ class MenuBuilder {
                 pendingSeparator = false;
             }
             any = true;
-            shell.addMenuItem(this._makeItem(id, props, sub, anyIcon));
+            shell.addMenuItem(this._makeItem(id, props, sub, anyIcon, anyToggle));
         }
     }
 
-    _makeItem(id, props, sub, reserveIcon) {
+    _makeItem(id, props, sub, reserveIcon, reserveToggle) {
         let label = cleanLabel(props.label);
         let enabled = props.enabled !== false;
 
@@ -442,11 +439,17 @@ class MenuBuilder {
             iconActor = null;
         }
 
-        let item = makeMenuItem(label, iconActor, reserveIcon);
-
         let toggleType = props["toggle-type"];
-        if (toggleType === "checkmark" || toggleType === "radio")
-            applyOrnament(item, toggleType, props["toggle-state"] === 1, label);
+        let on = props["toggle-state"] === 1;
+        let indicator = null;
+        if (toggleType === "checkmark")
+            indicator = on ? "\u2611" : "\u2610";
+        else if (toggleType === "radio")
+            indicator = on ? "\u25C9" : "\u25CB";
+        else if (reserveToggle)
+            indicator = "";
+
+        let item = makeMenuItem(label, iconActor, reserveIcon, indicator);
 
         item.setSensitive(enabled);
         item.connect("activate", () => this.sendEvent(id, "clicked"));
@@ -599,6 +602,20 @@ function findItemByPath(items, path) {
     return found ? found.id : null;
 }
 
+/*
+ * GTK does not tell what icon a menu entry has, so common entries get the standard icon of that name
+ * (applications use these names for them).
+ */
+const GTK_ITEM_ICONS = {
+    "refresh": "view-refresh-symbolic", "reload": "view-refresh-symbolic",
+    "information": "dialog-information-symbolic", "info": "dialog-information-symbolic",
+    "about": "help-about-symbolic", "help": "help-browser-symbolic",
+    "preferences": "preferences-other-symbolic", "options": "preferences-other-symbolic",
+    "settings": "preferences-system-symbolic",
+    "quit": "application-exit-symbolic", "exit": "application-exit-symbolic",
+    "close": "window-close-symbolic", "open": "document-open-symbolic"
+};
+
 /* Translate scanned GTK menu items into a dbusmenu-shaped layout. targets maps local ids -> {gtkId, path}. */
 function gtkItemsToLayout(items, targets) {
     let counter = 0;
@@ -615,8 +632,9 @@ function gtkItemsToLayout(items, targets) {
             enabled: it.enabled !== false,
             "children-display": kids.length > 0 ? "submenu" : ""
         };
-        if (it.icon)
-            props["icon-name"] = it.icon;
+        let icon = it.icon || (kids.length === 0 ? GTK_ITEM_ICONS[label.replace(/[.\u2026_]+$/, "").replace(/_/g, "").trim().toLowerCase()] : null);
+        if (icon)
+            props["icon-name"] = icon;
         if (it.toggle) {
             props["toggle-type"] = it.toggle;
             props["toggle-state"] = it.checked ? 1 : 0;
@@ -1685,7 +1703,9 @@ class XAppEntry extends TrayEntry {
         this.proxy = proxy;
         this.pending = true;
 
-        this.primaryIsMenu = this.applet.isLearned(this.stableId() + "#menu2");   // learned: a left click opens a menu, not a window
+        this._primaryVerified = false;   // true once a left-click menu was really read in this session
+        this._clickBusyUntil = 0;
+        this.primaryIsMenu = this.applet.isLearned(this.stableId() + "#menu3");   // learned: a left click opens a menu, not a window
         this.lastButton = 3;
         this.proxy.icon_size = this.applet.getPanelIconSize(St.IconType.FULLCOLOR);
         this._proxy_prop_change_id = this.proxy.connect("g-properties-changed",
@@ -1819,15 +1839,44 @@ class XAppEntry extends TrayEntry {
             this.synthClick(1, time);
             return;
         }
+        /* While this click plays out nothing else may open the application's popups in the background */
+        this._clickBusyUntil = GLib.get_monotonic_time() + 4e6;
         let hider = applet.hidePopupsFor(this.pid);
+
+        /* If the click opens one of the application's windows, it was not a menu click */
+        let opened = false;
+        let hooks = [];
+        let watch = (obj, signal, fn) => hooks.push([obj, obj.connect(signal, fn)]);
+        let isWindow = (win) => !!win && !win.is_override_redirect() && this.windowMatches(win);
+        watch(global.window_manager, "map", (wm, actor) => {
+            if (isWindow(actor.meta_window))
+                opened = true;
+        });
+        watch(global.window_manager, "unminimize", (wm, actor) => {
+            if (isWindow(actor.meta_window))
+                opened = true;
+        });
+        watch(global.display, "notify::focus-window", () => {
+            if (isWindow(global.display.focus_window))
+                opened = true;
+        });
+        let unwatch = () => {
+            for (let [obj, id] of hooks)
+                obj.disconnect(id);
+            hooks = [];
+        };
+
         this.synthClick(1, time);
         let tries = 0;
         Mainloop.timeout_add(100, () => {
-            if (this.destroyed) {
+            if (this.destroyed || opened) {
+                unwatch();
                 hider.stop();
                 return false;
             }
-            if (hider.count() > 0) {
+            /* A popup of the application that is not our own background menu reading: the click's menu */
+            if (hider.count() > 0 && !applet._scanBusy) {
+                unwatch();
                 this._sawPopup = true;   // something popped up, so the click did have an effect
                 applet.gtkBridge.scan(this.pid, (res, err) => {
                     if (this.destroyed) {
@@ -1837,8 +1886,9 @@ class XAppEntry extends TrayEntry {
                     if (res && res.items && res.items.length > 0) {
                         /* Only now is it certain that a left click shows a menu */
                         this.primaryIsMenu = true;
+                        this._primaryVerified = true;
                         this.lastButton = 1;
-                        applet.markLearned(this.stableId() + "#menu2");
+                        applet.markLearned(this.stableId() + "#menu3");
                         this.gtkItems = res.items;
                         this.gtkEpoch = res.epoch;
                         applet.storeMenu(this.stableId(), 1, res.items, res.epoch);
@@ -1856,6 +1906,7 @@ class XAppEntry extends TrayEntry {
                 return false;
             }
             if (++tries >= 6) {
+                unwatch();
                 hider.stop();   // no popup: the click did something else (e.g. opened a window)
                 return false;
             }
@@ -1932,7 +1983,7 @@ class XAppEntry extends TrayEntry {
             return;
         this.primaryIsMenu = false;
         this.lastButton = 3;
-        this.applet.forgetLearned(this.stableId() + "#menu2");
+        this.applet.forgetLearned(this.stableId() + "#menu3");
         delete this.applet.menuCache[this.stableId() + "|1"];
         this.applet.menuContentChanged(this);   // brings the "Open ..." entry back if the menu is showing
     }
@@ -1952,7 +2003,7 @@ class XAppEntry extends TrayEntry {
             return;
         }
         let button = this.nativeButton();
-        let cached = this.applet.cachedMenu(this.stableId(), button);
+        let cached = (button === 1 && !this._primaryVerified) ? null : this.applet.cachedMenu(this.stableId(), button);
         if (cached) {
             this.gtkItems = cached.items;
             this.gtkEpoch = cached.epoch;
@@ -1960,16 +2011,19 @@ class XAppEntry extends TrayEntry {
             return;
         }
         this.whenReleased(() => {
-            this.scanNative(() => this.synthClick(button, this.lastEventTime), cb,
-                { button: button, onNoPopup: this._noPopupHandler(button) });
+            this.scanNative(() => this.synthClick(button, this.lastEventTime), (ok) => {
+                if (ok && button === 1 && this.gtkItems)
+                    this._primaryVerified = true;
+                cb(ok);
+            }, { button: button, onNoPopup: this._noPopupHandler(button) });
         });
     }
 
     /* Called when a menu of this entry was closed: update the stored copy for the next opening */
-    scheduleRefresh(retries) {
+    scheduleRefresh(retries, delay) {
         if (this.destroyed || !this.canTranslateNative() || this._refreshTimer)
             return;
-        this._refreshTimer = Mainloop.timeout_add(500, () => {
+        this._refreshTimer = Mainloop.timeout_add(delay || 500, () => {
             this._refreshTimer = 0;
             this.refreshNative(retries || 0);
             return false;
@@ -1980,13 +2034,17 @@ class XAppEntry extends TrayEntry {
         if (this.destroyed || !this.canTranslateNative())
             return;
         let applet = this.applet;
-        if (applet.menu.isOpen || applet.pointerButtonsDown() || applet._scanBusy) {
+        /* Not while a menu is open, a button is held, another reading runs, the icon was just clicked, or the
+         * user is working in the application (a stray key press must never reach its window) */
+        if (applet.menu.isOpen || applet.pointerButtonsDown() || applet._scanBusy ||
+            GLib.get_monotonic_time() < this._clickBusyUntil || this.windowMatches(global.display.focus_window)) {
             if (retries < 8)
-                this.scheduleRefresh(retries + 1);
+                this.scheduleRefresh(retries + 1, 700);
             return;
         }
-        /* Never "click" the icon's primary action in the background unless its menu was read that way before */
-        let button = (this.primaryIsMenu && this.lastButton === 1 && applet.cachedMenu(this.stableId(), 1)) ? 1 : 3;
+        /* Never "click" the icon's primary action in the background unless its menu was read that way this session */
+        let button = (this.primaryIsMenu && this.lastButton === 1 && this._primaryVerified &&
+            applet.cachedMenu(this.stableId(), 1)) ? 1 : 3;
         applet._scanBusy = true;
         let watchdog = Mainloop.timeout_add(6000, () => {
             watchdog = 0;
@@ -2722,7 +2780,8 @@ class UnifiedTrayApplet extends Applet.Applet {
                 this.menuToken++;
                 this._menuClosedAt = Clutter.get_current_event_time();
                 if (closedEntry && typeof closedEntry.scheduleRefresh === "function")
-                    closedEntry.scheduleRefresh(0);
+                    closedEntry.scheduleRefresh(0, this._closedByActivation ? 3000 : 500);
+                this._closedByActivation = false;
             }
         });
     }
